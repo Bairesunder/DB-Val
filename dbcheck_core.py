@@ -1,80 +1,57 @@
-"""
-dbcheck_core.py
-Refactored, UI-friendly core for the dbcheck.py routines.
-
-Notes:
-- Logic mirrors the original script (compData / validCollar / validSurvey / validAssay)
-  but returns DataFrames and summaries instead of printing / writing files.
-- Default behaviour follows the original: numeric differences use abs(delta) > 0.001,
-  and NA values are filled with 0 during comparison (script-compatible).
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 
-@dataclass
-class CompareResult:
-    col_only_old: List[str]
-    col_only_new: List[str]
-    additional_records: pd.DataFrame   # keys + DB (old/new)
-    differences: pd.DataFrame          # keys + binary flags + *_old / *_new
-    diff_counts: pd.DataFrame          # column + n_different
-    n_old: int
-    n_new: int
-    n_match: int
-
-
-def _normalize_colname(s: str) -> str:
-    return "".join(ch for ch in s.strip().lower() if ch.isalnum() or ch == "_")
-
-
-def suggest_columns(columns: List[str], candidates: List[str]) -> Optional[str]:
-    """Return the first matching column name using case/format-insensitive matching."""
-    norm_map = {_normalize_colname(c): c for c in columns}
-    for cand in candidates:
-        key = _normalize_colname(cand)
-        if key in norm_map:
-            return norm_map[key]
-    return None
-
-
-def _convert_common_types(df_old: pd.DataFrame, df_new: pd.DataFrame, bhid_col: str) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], List[str]]:
+def read_csv_uploaded(uploaded_file) -> pd.DataFrame:
     """
-    Convert common columns to the most common type in OLD file (matching original compData logic).
-    Returns converted (old, new, to_str, to_num).
+    Reads a Streamlit uploaded CSV with a robust encoding fallback.
     """
-    common = [c for c in df_old.columns if c in df_new.columns]
+    data = uploaded_file.getvalue()
+    for enc in ("utf-8", "ISO-8859-1", "latin1"):
+        try:
+            return pd.read_csv(pd.io.common.BytesIO(data), encoding=enc)
+        except Exception:
+            continue
+    # last resort
+    return pd.read_csv(pd.io.common.BytesIO(data), encoding_errors="ignore")
+
+
+def _coerce_shared_column_types(df_old: pd.DataFrame, df_new: pd.DataFrame, bhid: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Mimics the original script: for columns present in both, coerce types based on OLD majority type.
+    """
+    df_old = df_old.copy()
+    df_new = df_new.copy()
+
+    shared = [c for c in df_old.columns if c in df_new.columns]
     to_str: List[str] = []
     to_num: List[str] = []
 
-    for col in common:
-        if col == bhid_col:
+    for col in shared:
+        if col == bhid:
             continue
-        # Majority type based on OLD
-        counttypes = df_old[col].apply(type).value_counts()
-        majtype = counttypes.index[counttypes.argmax()] if len(counttypes) else object
-        if majtype == str:
+        counts = df_old[col].apply(type).value_counts(dropna=False)
+        if len(counts) == 0:
+            continue
+        maj_type = counts.index[counts.argmax()]
+        if maj_type == str:
             to_str.append(col)
         else:
             to_num.append(col)
 
-    # Apply conversions
-    def apply(df: pd.DataFrame) -> pd.DataFrame:
-        out = df.copy()
-        if to_str:
-            out[to_str] = out[to_str].astype(str)
-        if to_num:
-            out[to_num] = out[to_num].apply(pd.to_numeric, errors="coerce")
-        out[bhid_col] = out[bhid_col].astype(str)
-        return out
+    if to_str:
+        df_old[to_str] = df_old[to_str].astype(str)
+        df_new[to_str] = df_new[to_str].astype(str)
+    if to_num:
+        df_old[to_num] = df_old[to_num].apply(pd.to_numeric, errors="coerce")
+        df_new[to_num] = df_new[to_num].apply(pd.to_numeric, errors="coerce")
 
-    return apply(df_old), apply(df_new), to_str, to_num
+    return df_old, df_new
 
 
 def compare_data(
@@ -85,292 +62,293 @@ def compare_data(
     at: Optional[str] = None,
     from_i: Optional[str] = None,
     to_i: Optional[str] = None,
-    numeric_tolerance: float = 0.001,
-    script_compatible_fillna: bool = True,
-) -> CompareResult:
+    tol: float = 0.001,
+    compat_fillna: bool = True,
+) -> Dict[str, pd.DataFrame]:
     """
-    Compare OLD vs NEW dataset for:
-      - collar: key = [bhid]
-      - survey: key = [bhid, at]
-      - assay/litho: key = [bhid, from_i, to_i]
+    Compare OLD vs NEW similar to compData() in the original script.
+    Returns:
+      - additional_rows: rows present only in one file (DB=old/new)
+      - diff_table: binary diff + old/new values where diff
+      - diff_counts: per-column diff counts
+      - summary: dict with key metrics
     """
-
     ftype = ftype.lower().strip()
-    if ftype not in {"collar", "survey", "assay", "litho"}:
-        raise ValueError("ftype must be one of: collar, survey, assay, litho")
+    df_old = df_old.copy()
+    df_new = df_new.copy()
 
+    # BHID as string
+    if bhid not in df_old.columns or bhid not in df_new.columns:
+        raise ValueError(f"BHID column '{bhid}' must exist in both files.")
+    df_old[bhid] = df_old[bhid].astype(str)
+    df_new[bhid] = df_new[bhid].astype(str)
+
+    # Coerce shared types (script behavior)
+    df_old, df_new = _coerce_shared_column_types(df_old, df_new, bhid=bhid)
+
+    # Keys by ftype
     if ftype == "collar":
         key = [bhid]
     elif ftype == "survey":
         if not at:
-            raise ValueError("at is required for survey comparisons")
+            raise ValueError("Survey comparison requires 'at' column.")
         key = [bhid, at]
-    else:
-        if not (from_i and to_i):
-            raise ValueError("from_i and to_i are required for assay/litho comparisons")
+    elif ftype in ("assay", "litho"):
+        if not from_i or not to_i:
+            raise ValueError("Assay/Litho comparison requires 'from_i' and 'to_i' columns.")
         key = [bhid, from_i, to_i]
+    else:
+        raise ValueError("ftype must be one of: collar, survey, assay, litho")
 
-    # Convert shared column types based on OLD (original behaviour)
-    df_old, df_new, _, _ = _convert_common_types(df_old, df_new, bhid)
-
-    col_only_old = sorted(list(set(df_old.columns) - set(df_new.columns)))
-    col_only_new = sorted(list(set(df_new.columns) - set(df_old.columns)))
+    for k in key:
+        if k not in df_old.columns or k not in df_new.columns:
+            raise ValueError(f"Key column '{k}' must exist in both files.")
 
     # Additional records (outer merge)
     merge_all = pd.merge(df_old, df_new, how="outer", on=key, indicator=True, copy=False)
     df_add = merge_all.loc[merge_all["_merge"] != "both", key + ["_merge"]].copy()
     df_add.reset_index(drop=True, inplace=True)
-    df_add["_merge"] = df_add["_merge"].astype("object").replace({"left_only": "old", "right_only": "new"})
+    df_add["_merge"] = df_add["_merge"].replace({"left_only": "old", "right_only": "new"})
     df_add.rename(columns={"_merge": "DB"}, inplace=True)
 
-    # Differences (inner merge)
-    merge_int = pd.merge(df_old, df_new, how="inner", on=key, indicator=True, copy=False)
-
-    if script_compatible_fillna:
-        # Original script fills NA with 0 across all columns (keeps output consistent with historical usage).
-        # We apply it column-by-column to avoid issues with categorical columns (e.g. merge indicator).
+    # fillna(0) in merged tables if compat
+    if compat_fillna:
         for c in merge_all.columns:
-            if merge_all[c].isnull().values.any():
-                merge_all[c] = merge_all[c].fillna(0)
+            if merge_all[c].isnull().any():
+                merge_all[c].fillna(0, inplace=True)
+
+    # Intersection merge for value comparison
+    merge_int = pd.merge(df_old, df_new, how="inner", on=key, suffixes=("_old", "_new"), copy=False)
+    if compat_fillna:
         for c in merge_int.columns:
-            if merge_int[c].isnull().values.any():
-                merge_int[c] = merge_int[c].fillna(0)
+            if merge_int[c].isnull().any():
+                merge_int[c].fillna(0, inplace=True)
 
-    # Identify paired columns
-    cols_o = sorted([c for c in merge_int.columns if c.endswith("_x")])
-    cols_n = sorted([c for c in merge_int.columns if c.endswith("_y")])
+    # Determine comparable pairs
+    cols_old = sorted([c for c in merge_int.columns if c.endswith("_old")])
+    cols_new = sorted([c for c in merge_int.columns if c.endswith("_new")])
 
+    # Build diff table
     df_diff = pd.DataFrame({k: merge_int[k] for k in key})
 
-    for colx, coly in zip(cols_o, cols_n):
-        base = colx[:-2]
-        sx = merge_int[colx]
-        sy = merge_int[coly]
+    for c_old in cols_old:
+        base = c_old[:-4]  # strip _old
+        c_new = base + "_new"
+        if c_new not in merge_int.columns:
+            continue
 
-        # If dtypes differ, mark error like original.
-        if sx.dtype != sy.dtype:
+        s_old = merge_int[c_old]
+        s_new = merge_int[c_new]
+
+        if s_old.dtype != s_new.dtype:
+            # if mismatch, mark error
             df_diff[base] = "ERROR"
             continue
 
-        if sx.dtype == "object":
-            cond = (sx.astype(str) != sy.astype(str))
-            df_diff[base] = (cond.astype(int))
-            if cond.any():
-                df_diff.loc[cond, f"{base}_old"] = sx[cond]
-                df_diff.loc[cond, f"{base}_new"] = sy[cond]
+        if s_old.dtype == "object":
+            cond = (s_old.astype(str) != s_new.astype(str))
         else:
-            # numeric
-            cond = (np.abs(pd.to_numeric(sx, errors="coerce") - pd.to_numeric(sy, errors="coerce")) > numeric_tolerance)
-            df_diff[base] = (cond.astype(int))
-            if cond.any():
-                df_diff.loc[cond, f"{base}_old"] = sx[cond]
-                df_diff.loc[cond, f"{base}_new"] = sy[cond]
+            cond = (np.abs(pd.to_numeric(s_old, errors="coerce") - pd.to_numeric(s_new, errors="coerce")) > float(tol))
 
-    # counts
-    count_rows = []
-    for c in df_diff.columns:
-        if c in key or c.endswith("_old") or c.endswith("_new"):
-            continue
+        df_diff[base] = cond.astype(int)
+        if cond.any():
+            df_diff.loc[cond, base + "_old"] = s_old[cond]
+            df_diff.loc[cond, base + "_new"] = s_new[cond]
+
+    # Counts per diff column
+    diff_cols = [c for c in df_diff.columns if c not in key and not c.endswith("_old") and not c.endswith("_new")]
+    counts = []
+    for c in diff_cols:
         if df_diff[c].dtype == "object":
-            # 'ERROR' counts as differences in summary
-            n = int((df_diff[c] != 0).sum())
-        else:
-            n = int(df_diff[c].sum())
-        count_rows.append((c, n))
-    diff_counts = pd.DataFrame(count_rows, columns=["column", "n_different"]).sort_values("n_different", ascending=False)
+            continue
+        counts.append((c, int(df_diff[c].sum())))
+    df_counts = pd.DataFrame(counts, columns=["COLUMN", "DIFF_COUNT"]).sort_values("DIFF_COUNT", ascending=False).reset_index(drop=True)
 
-    return CompareResult(
-        col_only_old=col_only_old,
-        col_only_new=col_only_new,
-        additional_records=df_add,
-        differences=df_diff,
-        diff_counts=diff_counts,
-        n_old=len(df_old),
-        n_new=len(df_new),
-        n_match=len(merge_int),
-    )
+    # records with any differences
+    if diff_cols:
+        numeric_cols = [c for c in diff_cols if pd.api.types.is_numeric_dtype(df_diff[c])]
+        rec_with_diff = int((df_diff[numeric_cols].sum(axis=1) > 0).sum()) if numeric_cols else 0
+    else:
+        rec_with_diff = 0
+
+    summary = {
+        "old_unique": int((df_add["DB"] == "old").sum()),
+        "new_unique": int((df_add["DB"] == "new").sum()),
+        "matches": int(len(merge_int)),
+        "records_with_differences": int(rec_with_diff),
+    }
+
+    return {
+        "additional_rows": df_add,
+        "diff_table": df_diff,
+        "diff_counts": df_counts,
+        "summary": summary,
+    }
 
 
-@dataclass
-class ValidationResult:
-    errors: pd.DataFrame
-    summary: pd.DataFrame   # TYPE + n
-    extra: Dict[str, pd.DataFrame]  # optional computed outputs
+def _summary_by_type(issues: pd.DataFrame) -> pd.DataFrame:
+    if issues is None or len(issues) == 0:
+        return pd.DataFrame(columns=["TYPE", "n"])
+    out = issues["TYPE"].astype(str).value_counts().reset_index()
+    out.columns = ["TYPE", "n"]
+    return out
+
+
+def validate_collar(df: pd.DataFrame, bhid: str, x: str, y: str, z: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Port of validCollar() returning:
+      - summary (TYPE, n)
+      - issues (rows with TYPE)
+    """
+    cols = [bhid, x, y, z]
+    for c in cols:
+        if c not in df.columns:
+            raise ValueError(f"Column '{c}' not found in collar file.")
+
+    collar = df[cols].copy()
+    collar[bhid] = collar[bhid].astype(str)
+    collar[[x, y, z]] = collar[[x, y, z]].apply(pd.to_numeric, errors="coerce")
+
+    issues = []
+
+    # 0 Zero/Null values
+    cond = collar[(collar[x] == 0) | (collar[y] == 0) | (collar[z] == 0) | (collar.isnull().any(axis=1))]
+    if len(cond):
+        tmp = cond.copy()
+        tmp["TYPE"] = "Zero/Null values"
+        issues.append(tmp)
+
+    # 1 Rounded coordinates
+    cond = collar[(collar[x] % 1 == 0) & (collar[y] % 1 == 0) & (collar[z] % 1 == 0)]
+    if len(cond):
+        tmp = cond.copy()
+        tmp["TYPE"] = "Rounded coordinates"
+        issues.append(tmp)
+
+    # 2 duplicated Hole ID
+    cond = collar[collar[bhid].duplicated(keep=False)]
+    if len(cond):
+        tmp = cond.copy()
+        tmp["TYPE"] = "duplicated Hole ID"
+        issues.append(tmp)
+
+    # 3 duplicated coordinates
+    cond = collar[collar[[x, y, z]].duplicated(keep=False)]
+    if len(cond):
+        tmp = cond.copy()
+        tmp["TYPE"] = "duplicated coordinates"
+        issues.append(tmp)
+
+    # 4 inverted X and Y (heuristic from script)
+    cond = collar[
+        (collar[x] > (collar[y].mean() - collar[y].std()))
+        & (collar[x] < (collar[y].mean() + collar[y].std()))
+        & (collar[y] > (collar[x].mean() - collar[x].std()))
+        & (collar[y] < (collar[x].mean() + collar[x].std()))
+    ]
+    if len(cond):
+        tmp = cond.copy()
+        tmp["TYPE"] = "inverted X and Y"
+        issues.append(tmp)
+
+    # 5 coordinates to be reviewed (5 sigma)
+    c1 = (collar[x] > collar[x].mean() + 5 * collar[x].std()) | (collar[x] < collar[x].mean() - 5 * collar[x].std())
+    c2 = (collar[y] > collar[y].mean() + 5 * collar[y].std()) | (collar[y] < collar[y].mean() - 5 * collar[y].std())
+    c3 = (collar[z] > collar[z].mean() + 5 * collar[z].std()) | (collar[z] < collar[z].mean() - 5 * collar[z].std())
+    cond = collar[c1 | c2 | c3]
+    if len(cond):
+        tmp = cond.copy()
+        tmp["TYPE"] = "coordinates to be reviewed"
+        issues.append(tmp)
+
+    # 6 Holeid with spaces on last character
+    cond = collar[collar[bhid].astype(str).str[-1:] == " "]
+    if len(cond):
+        tmp = cond.copy()
+        tmp["TYPE"] = "Holeid with spaces on last character"
+        issues.append(tmp)
+
+    issues_df = pd.concat(issues, ignore_index=True) if issues else pd.DataFrame(columns=cols + ["TYPE"])
+    summary = _summary_by_type(issues_df)
+    return summary, issues_df
 
 
 def validate_survey(
     df: pd.DataFrame,
     bhid: str,
     at: str,
-    azimuth: str,
+    az: str,
     dip: str,
-    dls_threshold_deg_per_30m: float = 15.0,
-    check_duplicates_globally: bool = True,
-) -> ValidationResult:
+    dls_threshold: float = 15.0,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Mirrors validSurvey:
-      1) invalid Dip/Azimuth (dip outside [-90,90] or azimuth outside [-360,360])
-      2) null values
-      3) duplicated values (AT/AZIMUTH/DIP) - global by default (script behaviour)
-      4) DLS > threshold per 30 m
+    Port of validSurvey() returning:
+      - summary (TYPE, n)
+      - issues
+      - dls_df (full DLS calc table)
     """
-    df = df.copy()
-    fields = [bhid, at, azimuth, dip]
-    df = df[fields].copy()
-    df[bhid] = df[bhid].astype(str)
-    df[[at, azimuth, dip]] = df[[at, azimuth, dip]].apply(pd.to_numeric, errors="coerce")
-    df.sort_values([bhid, at], inplace=True)
+    for c in (bhid, at, az, dip):
+        if c not in df.columns:
+            raise ValueError(f"Column '{c}' not found in survey file.")
 
-    errors = []
+    survey = df[[bhid, at, az, dip]].copy()
+    survey[bhid] = survey[bhid].astype(str)
+    survey[[at, az, dip]] = survey[[at, az, dip]].apply(pd.to_numeric, errors="coerce")
+    survey = survey.sort_values([bhid, at], ascending=True)
 
-    # 1 invalid values
-    cond0 = df[(df[dip] > 90) | (df[dip] < -90) | (df[azimuth] > 360) | (df[azimuth] < -360)].copy()
-    if len(cond0):
-        cond0["TYPE"] = "invalid Dip/Azimuth"
-        errors.append(cond0)
+    issues = []
 
-    # 2 nulls
-    cond1 = df[df.isnull().any(axis=1)].copy()
-    if len(cond1):
-        cond1["TYPE"] = "null values"
-        errors.append(cond1)
+    # 0 invalid Dip/Azimuth
+    cond = survey[(survey[dip] > 90) | (survey[dip] < -90) | (survey[az] > 360) | (survey[az] < -360)]
+    if len(cond):
+        tmp = cond.copy()
+        tmp["TYPE"] = "invalid Dip/Azimuth"
+        issues.append(tmp)
 
-    # 3 duplicates
-    if check_duplicates_globally:
-        cond2 = df[df[[at, azimuth, dip]].duplicated(keep=False)].copy()
-    else:
-        cond2 = df[df.duplicated([bhid, at, azimuth, dip], keep=False)].copy()
-    if len(cond2):
-        cond2["TYPE"] = "duplicated values"
-        errors.append(cond2)
+    # 1 null values
+    cond = survey[survey.isnull().any(axis=1)]
+    if len(cond):
+        tmp = cond.copy()
+        tmp["TYPE"] = "null values"
+        issues.append(tmp)
 
-    # 4 DLS
-    dls = df.copy()
-    dls["dip2"] = dls.groupby(bhid)[dip].shift(-1)
-    dls["az2"] = dls.groupby(bhid)[azimuth].shift(-1)
-    dls["at2"] = dls.groupby(bhid)[at].shift(1)
-    dls["interval"] = dls[at] - dls["at2"]
+    # 2 duplicated values (at, az, dip)
+    cond = survey[survey[[at, az, dip]].duplicated(keep=False)]
+    if len(cond):
+        tmp = cond.copy()
+        tmp["TYPE"] = "duplicated values"
+        issues.append(tmp)
 
-    # Dogleg severity (same formula as original)
-    dls["DLS"] = np.degrees(
-        np.arccos(
-            np.sin(np.radians(dls[dip])) * np.sin(np.radians(dls["dip2"])) +
-            (np.cos(np.radians(dls[dip])) * np.cos(np.radians(dls["dip2"])) * np.cos(np.radians(dls["az2"] - dls[azimuth])))
+    # 3 DLS threshold
+    dls_df = survey.copy()
+    dls_df["dip2"] = dls_df.groupby([bhid])[dip].shift(-1)
+    dls_df["az2"] = dls_df.groupby([bhid])[az].shift(-1)
+    dls_df["at2"] = dls_df.groupby([bhid])[at].shift(1)
+    dls_df["interval"] = dls_df[at] - dls_df["at2"]
+
+    # Avoid division by 0
+    dls_df["interval"] = dls_df["interval"].replace(0, np.nan)
+
+    dls_df["DLS"] = (
+        np.degrees(
+            np.arccos(
+                np.sin(np.radians(dls_df[dip])) * np.sin(np.radians(dls_df["dip2"]))
+                + (np.cos(np.radians(dls_df[dip])) * np.cos(np.radians(dls_df["dip2"])) * np.cos(np.radians(dls_df["az2"] - dls_df[az])))
+            )
         )
-    ) / dls["interval"] * 30.0
-
-    cond3 = dls[dls["DLS"] > dls_threshold_deg_per_30m][fields + ["DLS"]].copy()
-    if len(cond3):
-        cond3["TYPE"] = f"DLS > {dls_threshold_deg_per_30m:g} degrees / 30 m"
-        errors.append(cond3[fields + ["TYPE", "DLS"]])
-
-    if errors:
-        errordf = pd.concat(errors, ignore_index=True)
-    else:
-        errordf = pd.DataFrame(columns=fields + ["TYPE"])
-
-    summary = (
-        errordf.groupby("TYPE", dropna=False)
-        .size()
-        .reset_index(name="n")
-        .sort_values("n", ascending=False)
-        if len(errordf) else pd.DataFrame(columns=["TYPE", "n"])
+        / dls_df["interval"]
+        * 30
     )
 
-    return ValidationResult(errors=errordf, summary=summary, extra={"survey_dls": dls})
+    cond = dls_df[dls_df["DLS"] > float(dls_threshold)].copy()
+    if len(cond):
+        tmp = cond[[bhid, at, az, dip]].copy()
+        tmp["TYPE"] = f"DLS > {dls_threshold:g} degrees / 30 m"
+        issues.append(tmp)
 
-
-def validate_collar(
-    df: pd.DataFrame,
-    bhid: str,
-    x: str,
-    y: str,
-    z: str,
-) -> ValidationResult:
-    """
-    Mirrors validCollar:
-      1) Zero/Null values
-      2) Rounded coordinates (integer)
-      3) duplicated Hole ID
-      4) duplicated coordinates (XYZ)
-      5) inverted X and Y (heuristic)
-      6) coordinates to be reviewed (outside mean ± 5 std)
-      7) Holeid with spaces on last character
-    """
-    df = df.copy()
-    fields = [bhid, x, y, z]
-    collar = df[fields].copy()
-    collar[bhid] = collar[bhid].astype(str)
-
-    errors = []
-
-    # 1 zero/null
-    cond0 = collar[(collar[x] == 0) | (collar[y] == 0) | (collar[z] == 0) | (collar.isnull().any(axis=1))].copy()
-    if len(cond0):
-        cond0["TYPE"] = "Zero/Null values"
-        errors.append(cond0)
-
-    # 2 rounded coordinates
-    # Ensure numeric for modulo; coercing errors to NaN will drop from integer test.
-    tmp = collar.copy()
-    tmp[[x, y, z]] = tmp[[x, y, z]].apply(pd.to_numeric, errors="coerce")
-    cond1 = tmp[(tmp[x] % 1 == 0) & (tmp[y] % 1 == 0) & (tmp[z] % 1 == 0)].copy()
-    if len(cond1):
-        cond1["TYPE"] = "Rounded coordinates"
-        errors.append(cond1)
-
-    # 3 duplicated holeid
-    cond2 = collar[collar[bhid].duplicated(keep=False)].copy()
-    if len(cond2):
-        cond2["TYPE"] = "duplicated Hole ID"
-        errors.append(cond2)
-
-    # 4 duplicated coords
-    cond3 = collar[collar[[x, y, z]].duplicated(keep=False)].copy()
-    if len(cond3):
-        cond3["TYPE"] = "duplicated coordinates"
-        errors.append(cond3)
-
-    # 5 inverted X/Y heuristic (same as original)
-    cx = tmp[x]
-    cy = tmp[y]
-    cond4 = collar[
-        (cx > (cy.mean() - cy.std())) & (cx < (cy.mean() + cy.std())) &
-        (cy > (cx.mean() - cx.std())) & (cy < (cx.mean() + cx.std()))
-    ].copy()
-    if len(cond4):
-        cond4["TYPE"] = "inverted X and Y"
-        errors.append(cond4)
-
-    # 6 outliers > 5 std
-    c1 = (tmp[x] > tmp[x].mean() + 5 * tmp[x].std()) | (tmp[x] < tmp[x].mean() - 5 * tmp[x].std())
-    c2 = (tmp[y] > tmp[y].mean() + 5 * tmp[y].std()) | (tmp[y] < tmp[y].mean() - 5 * tmp[y].std())
-    c3 = (tmp[z] > tmp[z].mean() + 5 * tmp[z].std()) | (tmp[z] < tmp[z].mean() - 5 * tmp[z].std())
-    cond5 = collar[c1 | c2 | c3].copy()
-    if len(cond5):
-        cond5["TYPE"] = "coordinates to be reviewed"
-        errors.append(cond5)
-
-    # 7 trailing spaces
-    cond6 = collar[collar[bhid].str[-1:] == " "].copy()
-    if len(cond6):
-        cond6["TYPE"] = "Holeid with spaces on last character"
-        errors.append(cond6)
-
-    if errors:
-        errordf = pd.concat(errors, ignore_index=True)
-    else:
-        errordf = pd.DataFrame(columns=fields + ["TYPE"])
-
-    summary = (
-        errordf.groupby("TYPE", dropna=False)
-        .size()
-        .reset_index(name="n")
-        .sort_values("n", ascending=False)
-        if len(errordf) else pd.DataFrame(columns=["TYPE", "n"])
-    )
-
-    return ValidationResult(errors=errordf, summary=summary, extra={})
+    issues_df = pd.concat(issues, ignore_index=True) if issues else pd.DataFrame(columns=[bhid, at, az, dip, "TYPE"])
+    summary = _summary_by_type(issues_df)
+    return summary, issues_df, dls_df
 
 
 def validate_assay(
@@ -379,81 +357,70 @@ def validate_assay(
     from_i: str,
     to_i: str,
     grade_fields: List[str],
-    maxes: Union[List[float], np.ndarray],
+    maxes: List[float],
     sampleid: Optional[str] = None,
-) -> ValidationResult:
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Mirrors validAssay:
-      1) FROM/TO overlaps (within each hole)
-      2) negative/zero values (any grade field <= 0)
-      3) unexpected grades (any grade field > maxes[i])
-      4) duplicated Sample ID (if provided)
-      5) recurring assays (duplicate grade vectors, filtered by SUM>1)
+    Port of validAssay() returning:
+      - summary (TYPE, n)
+      - issues
     """
-    df = df.copy()
     cols = [bhid, from_i, to_i] + ([sampleid] if sampleid else []) + grade_fields
-    assay = df[cols].copy()
+    for c in cols:
+        if c not in df.columns:
+            raise ValueError(f"Column '{c}' not found in assay file.")
 
+    assay = df[cols].copy()
     assay[bhid] = assay[bhid].astype(str)
     assay[[from_i, to_i]] = assay[[from_i, to_i]].apply(pd.to_numeric, errors="coerce")
     assay[grade_fields] = assay[grade_fields].apply(pd.to_numeric, errors="coerce")
-    assay.sort_values([bhid, from_i, to_i], inplace=True)
+    assay = assay.sort_values([bhid, from_i, to_i])
 
-    errors = []
+    issues = []
 
-    # 1 overlaps
-    cond0 = assay.copy()
-    cond0["from_i2"] = assay.groupby(bhid)[from_i].shift(-1)
-    cond0["to_i2"] = assay.groupby(bhid)[to_i].shift(1)
-    cond0 = cond0[(cond0[to_i] > cond0["from_i2"]) | (cond0["to_i2"] > cond0[from_i])]
-    cond0 = cond0.drop(columns=["from_i2", "to_i2"])
-    if len(cond0):
-        cond0["TYPE"] = "FROM/TO overlaps"
-        errors.append(cond0)
+    # 0 FROM/TO overlaps
+    tmp = assay.copy()
+    tmp["from_i2"] = tmp.groupby([bhid])[from_i].shift(-1)
+    tmp["to_i2"] = tmp.groupby([bhid])[to_i].shift(1)
+    cond = tmp[(tmp[to_i] > tmp["from_i2"]) | (tmp["to_i2"] > tmp[from_i])].copy()
+    if len(cond):
+        out = cond.drop(columns=["from_i2", "to_i2"])
+        out["TYPE"] = "FROM/TO overlaps"
+        issues.append(out)
 
-    # 2 negative/zero
-    cond1 = assay[(assay[grade_fields] <= 0).any(axis=1)].copy()
-    if len(cond1):
-        cond1["TYPE"] = "negative/zero values"
-        errors.append(cond1)
+    # 1 negative/zero values
+    cond = assay[(assay[grade_fields] <= 0).any(axis=1)]
+    if len(cond):
+        out = cond.copy()
+        out["TYPE"] = "negative/zero values"
+        issues.append(out)
 
-    # 3 unexpected grades
-    maxes_arr = np.asarray(maxes, dtype=float)
-    if maxes_arr.shape[0] != len(grade_fields):
-        raise ValueError("maxes must have the same length as grade_fields")
-    # Broadcast compare
-    cond2 = assay[(assay[grade_fields] > maxes_arr).any(axis=1)].copy()
-    if len(cond2):
-        cond2["TYPE"] = "unexpected grades"
-        errors.append(cond2)
+    # 2 unexpected grades ( > maxes)
+    max_arr = np.array(maxes, dtype=float)
+    cond = assay[(assay[grade_fields].values > max_arr).any(axis=1)]
+    if len(cond):
+        out = cond.copy()
+        out["TYPE"] = "unexpected grades"
+        issues.append(out)
 
-    # 4 duplicated sample id
+    # 3 duplicated Sample ID
     if sampleid:
-        cond3 = assay[assay[sampleid].duplicated(keep=False)].copy()
-        if len(cond3):
-            cond3["TYPE"] = "duplicated Sample ID"
-            errors.append(cond3)
+        cond = assay[assay[sampleid].duplicated(keep=False)]
+        if len(cond):
+            out = cond.copy()
+            out["TYPE"] = "duplicated Sample ID"
+            issues.append(out)
 
-    # 5 recurring assays
-    cond4 = assay.copy().fillna(0)
-    cond4["SUM"] = cond4[grade_fields].sum(axis=1)
-    cond4 = cond4[(cond4["SUM"].duplicated(keep=False)) & (cond4["SUM"] > 1)]
-    cond4 = cond4[cond4[grade_fields].duplicated(keep=False)].sort_values(["SUM"], ascending=True).drop(columns=["SUM"])
-    if len(cond4):
-        cond4["TYPE"] = "recurring assays"
-        errors.append(cond4)
+    # 4 recurring assays (script logic)
+    tmp = assay.copy().fillna(0)
+    tmp["SUM"] = tmp[grade_fields].sum(axis=1)
+    cond = tmp[(tmp["SUM"].duplicated(keep=False)) & (tmp["SUM"] > 1)]
+    cond = cond[cond[grade_fields].duplicated(keep=False)]
+    if len(cond):
+        out = cond.drop(columns=["SUM"]).copy()
+        out["TYPE"] = "recurring assays"
+        issues.append(out)
 
-    if errors:
-        errordf = pd.concat(errors, ignore_index=True)
-    else:
-        errordf = pd.DataFrame(columns=cols + ["TYPE"])
-
-    summary = (
-        errordf.groupby("TYPE", dropna=False)
-        .size()
-        .reset_index(name="n")
-        .sort_values("n", ascending=False)
-        if len(errordf) else pd.DataFrame(columns=["TYPE", "n"])
-    )
-
-    return ValidationResult(errors=errordf, summary=summary, extra={})
+    issues_df = pd.concat(issues, ignore_index=True) if issues else pd.DataFrame(columns=cols + ["TYPE"])
+    summary = _summary_by_type(issues_df)
+    return summary, issues_df
