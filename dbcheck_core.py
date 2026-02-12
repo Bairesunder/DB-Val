@@ -18,6 +18,18 @@ import numpy as np
 import pandas as pd
 
 
+def _build_error_summary(errordf: pd.DataFrame) -> pd.DataFrame:
+    """Build standard TYPE + n summary with a stable empty schema."""
+    if errordf.empty:
+        return pd.DataFrame(columns=["TYPE", "n"])
+    return (
+        errordf.groupby("TYPE", dropna=False)
+        .size()
+        .reset_index(name="n")
+        .sort_values("n", ascending=False)
+    )
+
+
 @dataclass
 class CompareResult:
     col_only_old: List[str]
@@ -49,7 +61,7 @@ def _convert_common_types(df_old: pd.DataFrame, df_new: pd.DataFrame, bhid_col: 
     Convert common columns to the most common type in OLD file (matching original compData logic).
     Returns converted (old, new, to_str, to_num).
     """
-    common = [c for c in df_old.columns if c in df_new.columns]
+    common = list(df_old.columns.intersection(df_new.columns))
     to_str: List[str] = []
     to_num: List[str] = []
 
@@ -127,23 +139,21 @@ def compare_data(
     merge_int = pd.merge(df_old, df_new, how="inner", on=key, indicator=True, copy=False)
 
     if script_compatible_fillna:
-        # Original script fills NA with 0 across all columns (keeps output consistent with historical usage).
-        # We apply it column-by-column to avoid issues with categorical columns (e.g. merge indicator).
-        for c in merge_all.columns:
-            if merge_all[c].isnull().values.any():
-                merge_all[c] = merge_all[c].fillna(0)
+        # Original script fills NA with 0 across comparison columns.
         for c in merge_int.columns:
             if merge_int[c].isnull().values.any():
                 merge_int[c] = merge_int[c].fillna(0)
 
-    # Identify paired columns
-    cols_o = sorted([c for c in merge_int.columns if c.endswith("_x")])
-    cols_n = sorted([c for c in merge_int.columns if c.endswith("_y")])
+    # Identify paired columns by base name to avoid order-related mismatches.
+    cols_o = {c[:-2]: c for c in merge_int.columns if c.endswith("_x")}
+    cols_n = {c[:-2]: c for c in merge_int.columns if c.endswith("_y")}
+    comparable_bases = sorted(set(cols_o).intersection(cols_n))
 
     df_diff = pd.DataFrame({k: merge_int[k] for k in key})
 
-    for colx, coly in zip(cols_o, cols_n):
-        base = colx[:-2]
+    for base in comparable_bases:
+        colx = cols_o[base]
+        coly = cols_n[base]
         sx = merge_int[colx]
         sy = merge_int[coly]
 
@@ -248,8 +258,8 @@ def validate_survey(
     dls = df.copy()
     dls["dip2"] = dls.groupby(bhid)[dip].shift(-1)
     dls["az2"] = dls.groupby(bhid)[azimuth].shift(-1)
-    dls["at2"] = dls.groupby(bhid)[at].shift(1)
-    dls["interval"] = dls[at] - dls["at2"]
+    dls["at2"] = dls.groupby(bhid)[at].shift(-1)
+    dls["interval"] = dls["at2"] - dls[at]
 
     # Dogleg severity (same formula as original)
     dls["DLS"] = np.degrees(
@@ -269,13 +279,7 @@ def validate_survey(
     else:
         errordf = pd.DataFrame(columns=fields + ["TYPE"])
 
-    summary = (
-        errordf.groupby("TYPE", dropna=False)
-        .size()
-        .reset_index(name="n")
-        .sort_values("n", ascending=False)
-        if len(errordf) else pd.DataFrame(columns=["TYPE", "n"])
-    )
+    summary = _build_error_summary(errordf)
 
     return ValidationResult(errors=errordf, summary=summary, extra={"survey_dls": dls})
 
@@ -362,13 +366,7 @@ def validate_collar(
     else:
         errordf = pd.DataFrame(columns=fields + ["TYPE"])
 
-    summary = (
-        errordf.groupby("TYPE", dropna=False)
-        .size()
-        .reset_index(name="n")
-        .sort_values("n", ascending=False)
-        if len(errordf) else pd.DataFrame(columns=["TYPE", "n"])
-    )
+    summary = _build_error_summary(errordf)
 
     return ValidationResult(errors=errordf, summary=summary, extra={})
 
@@ -448,12 +446,6 @@ def validate_assay(
     else:
         errordf = pd.DataFrame(columns=cols + ["TYPE"])
 
-    summary = (
-        errordf.groupby("TYPE", dropna=False)
-        .size()
-        .reset_index(name="n")
-        .sort_values("n", ascending=False)
-        if len(errordf) else pd.DataFrame(columns=["TYPE", "n"])
-    )
+    summary = _build_error_summary(errordf)
 
     return ValidationResult(errors=errordf, summary=summary, extra={})
