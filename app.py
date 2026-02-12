@@ -7,13 +7,34 @@ import streamlit as st
 
 from dbcheck_core import (
     compare_data,
+    suggest_columns,
     validate_assay,
     validate_collar,
     validate_survey,
-    suggest_columns,
 )
 
 APP_TITLE = "DBCheck — Validación y comparación de BBDD (drilling)"
+
+SEVERITY_BY_TYPE = {
+    "invalid dip/azimuth": "Crítico",
+    "from/to overlaps": "Crítico",
+    "null values": "Mayor",
+    "zero/null values": "Mayor",
+    "duplicated hole id": "Mayor",
+    "duplicated sample id": "Mayor",
+    "duplicated values": "Mayor",
+    "duplicated coordinates": "Mayor",
+    "unexpected grades": "Mayor",
+    "negative/zero values": "Mayor",
+    "dls": "Mayor",
+    "coordinates to be reviewed": "Menor",
+    "rounded coordinates": "Menor",
+    "inverted x and y": "Menor",
+    "recurring assays": "Info",
+    "holeid with spaces on last character": "Info",
+}
+
+SEVERITY_ORDER = ["Crítico", "Mayor", "Menor", "Info"]
 
 st.set_page_config(
     page_title=APP_TITLE,
@@ -21,7 +42,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Minimal CSS polish
 st.markdown(
     """
     <style>
@@ -34,11 +54,14 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
 def _read_csv(uploaded, encoding: str) -> pd.DataFrame:
     return pd.read_csv(uploaded, encoding=encoding, low_memory=False)
 
+
 def _df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
+
 
 def _zip_bytes(files: Dict[str, bytes]) -> bytes:
     buf = io.BytesIO()
@@ -47,8 +70,10 @@ def _zip_bytes(files: Dict[str, bytes]) -> bytes:
             zf.writestr(name, data)
     return buf.getvalue()
 
+
 def _auto_select(columns: List[str], candidates: List[str]) -> Optional[str]:
     return suggest_columns(columns, candidates)
+
 
 def _mapping_ui(label: str, columns: List[str], default: Optional[str]) -> str:
     if default not in columns:
@@ -56,8 +81,99 @@ def _mapping_ui(label: str, columns: List[str], default: Optional[str]) -> str:
     idx = columns.index(default) if default in columns else 0
     return st.selectbox(label, options=columns, index=idx)
 
+
+def _severity_from_type(type_value: str) -> str:
+    normalized = str(type_value).strip().lower()
+    for key, sev in SEVERITY_BY_TYPE.items():
+        if key == "dls" and normalized.startswith("dls"):
+            return sev
+        if normalized == key:
+            return sev
+    return "Info"
+
+
+def _quality_profile(df: pd.DataFrame, title: str) -> None:
+    with st.expander(f"Perfil de calidad — {title}", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Filas", len(df))
+        c2.metric("Columnas", len(df.columns))
+        c3.metric("Duplicados exactos", int(df.duplicated().sum()))
+
+        nulls = (
+            df.isnull().mean().mul(100).round(2).sort_values(ascending=False).reset_index()
+            .rename(columns={"index": "column", 0: "%_null"})
+        )
+        st.markdown("**Top columnas por % de nulos**")
+        st.dataframe(nulls.head(15), use_container_width=True, height=250)
+
+        num_cols = df.select_dtypes(include="number")
+        if not num_cols.empty:
+            stats = num_cols.describe(percentiles=[0.5, 0.95]).T.reset_index().rename(columns={"index": "column"})
+            view_cols = [c for c in ["column", "min", "50%", "95%", "max"] if c in stats.columns]
+            st.markdown("**Resumen de rangos numéricos**")
+            st.dataframe(stats[view_cols].head(30), use_container_width=True, height=260)
+
+
+def _render_error_dashboard(errors: pd.DataFrame, bhid_col: str, depth_col: Optional[str] = None) -> pd.DataFrame:
+    if errors.empty:
+        st.success("No se detectaron errores con las reglas actuales.")
+        return errors
+
+    df = errors.copy()
+    df["SEVERITY"] = df["TYPE"].apply(_severity_from_type)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Errores detectados", int(len(df)))
+    m2.metric("Pozos afectados", int(df[bhid_col].nunique()) if bhid_col in df.columns else 0)
+    m3.metric("Críticos", int((df["SEVERITY"] == "Crítico").sum()))
+    m4.metric("Mayores", int((df["SEVERITY"] == "Mayor").sum()))
+
+    sev_summary = (
+        df.groupby("SEVERITY", as_index=False)
+        .size()
+        .rename(columns={"size": "n"})
+    )
+    sev_summary["SEVERITY"] = pd.Categorical(sev_summary["SEVERITY"], categories=SEVERITY_ORDER, ordered=True)
+    sev_summary = sev_summary.sort_values("SEVERITY")
+
+    st.markdown("#### Distribución por severidad")
+    st.bar_chart(sev_summary.set_index("SEVERITY")["n"])
+
+    type_summary = df.groupby("TYPE", as_index=False).size().rename(columns={"size": "n"}).sort_values("n", ascending=False)
+    st.markdown("#### Top errores por tipo")
+    st.dataframe(type_summary.head(10), use_container_width=True, height=220)
+
+    st.markdown("#### Filtros")
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        sev_selected = st.multiselect("Severidad", options=SEVERITY_ORDER, default=SEVERITY_ORDER)
+    with f2:
+        type_selected = st.multiselect("Tipo de error", options=sorted(df["TYPE"].dropna().astype(str).unique().tolist()))
+    with f3:
+        bhid_query = st.text_input("Buscar Hole ID contiene", value="").strip().lower()
+
+    filtered = df.copy()
+    if sev_selected:
+        filtered = filtered[filtered["SEVERITY"].isin(sev_selected)]
+    if type_selected:
+        filtered = filtered[filtered["TYPE"].isin(type_selected)]
+    if bhid_query and bhid_col in filtered.columns:
+        filtered = filtered[filtered[bhid_col].astype(str).str.lower().str.contains(bhid_query, na=False)]
+
+    if depth_col and depth_col in filtered.columns:
+        depth_num = pd.to_numeric(filtered[depth_col], errors="coerce")
+        depth_num = depth_num.dropna()
+        if not depth_num.empty and depth_num.min() < depth_num.max():
+            dmin, dmax = float(depth_num.min()), float(depth_num.max())
+            sel_min, sel_max = st.slider("Rango de profundidad", min_value=dmin, max_value=dmax, value=(dmin, dmax))
+            depth_vals = pd.to_numeric(filtered[depth_col], errors="coerce")
+            filtered = filtered[(depth_vals >= sel_min) & (depth_vals <= sel_max)]
+
+    return filtered
+
+
 st.title(APP_TITLE)
-st.caption("Interfaz minimalista para ejecutar el script de validación/comparación con archivos CSV.")
+st.caption("Interfaz para ejecutar validación/comparación con dashboard de calidad, severidad y filtros.")
 
 with st.sidebar:
     st.subheader("Entradas")
@@ -69,9 +185,6 @@ with st.sidebar:
 
 tab_compare, tab_collar, tab_survey, tab_assay = st.tabs(["Comparar OLD vs NEW", "Validar Collar", "Validar Survey", "Validar Assay"])
 
-# --------------------------
-# 1) COMPARE
-# --------------------------
 with tab_compare:
     st.subheader("Comparar OLD vs NEW")
     c1, c2, c3 = st.columns([1, 1, 1])
@@ -88,32 +201,24 @@ with tab_compare:
     if f_old and f_new:
         df_old = _read_csv(f_old, encoding)
         df_new = _read_csv(f_new, encoding)
+        _quality_profile(df_old, "OLD")
+        _quality_profile(df_new, "NEW")
 
         st.write("Vista rápida")
         st.dataframe(df_old.head(20), use_container_width=True)
 
-        cols_old = df_old.columns.tolist()
-        cols_new = df_new.columns.tolist()
-        # Prefer columns from OLD for mapping
-        cols = cols_old
-
+        cols = df_old.columns.tolist()
         st.markdown("#### Mapeo de columnas (clave)")
-        bhid_def = _auto_select(cols, ["BHID", "HOLEID", "HOLE_ID", "HOLE", "BH_ID"])
-        bhid = _mapping_ui("Hole ID (BHID)", cols, bhid_def)
+        bhid = _mapping_ui("Hole ID (BHID)", cols, _auto_select(cols, ["BHID", "HOLEID", "HOLE_ID", "HOLE", "BH_ID"]))
 
         at = from_i = to_i = None
         if ftype == "survey":
-            at_def = _auto_select(cols, ["AT", "DEPTH", "MD", "DEPTH_M", "MEASDEPTH"])
-            at = _mapping_ui("AT (profundidad medida)", cols, at_def)
+            at = _mapping_ui("AT (profundidad medida)", cols, _auto_select(cols, ["AT", "DEPTH", "MD", "DEPTH_M", "MEASDEPTH"]))
         if ftype in ("assay", "litho"):
-            from_def = _auto_select(cols, ["FROM", "FROM_M", "DEPTH_FROM", "FR"])
-            to_def = _auto_select(cols, ["TO", "TO_M", "DEPTH_TO", "DEPTH2", "T"])
-            from_i = _mapping_ui("FROM", cols, from_def)
-            to_i = _mapping_ui("TO", cols, to_def)
+            from_i = _mapping_ui("FROM", cols, _auto_select(cols, ["FROM", "FROM_M", "DEPTH_FROM", "FR"]))
+            to_i = _mapping_ui("TO", cols, _auto_select(cols, ["TO", "TO_M", "DEPTH_TO", "DEPTH2", "T"]))
 
-        run = st.button("Ejecutar comparación", type="primary")
-
-        if run:
+        if st.button("Ejecutar comparación", type="primary"):
             try:
                 res = compare_data(
                     ftype=ftype,
@@ -129,10 +234,14 @@ with tab_compare:
             except Exception as e:
                 st.error(f"Error ejecutando comparación: {e}")
             else:
-                m1, m2, m3 = st.columns(3)
+                m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Registros OLD", res.n_old)
                 m2.metric("Registros NEW", res.n_new)
-                m3.metric("Registros en común (match)", res.n_match)
+                m3.metric("Match", res.n_match)
+                m4.metric("Registros extra", int(len(res.additional_records)))
+
+                st.markdown("#### Top columnas con diferencias")
+                st.dataframe(res.diff_counts.head(15), use_container_width=True, height=240)
 
                 st.markdown("#### Columnas no coincidentes")
                 cc1, cc2 = st.columns(2)
@@ -146,37 +255,30 @@ with tab_compare:
                 st.markdown("#### Registros adicionales/diferentes (por clave)")
                 st.dataframe(res.additional_records, use_container_width=True, height=260)
 
-                st.markdown("#### Diferencias por columna (conteo)")
-                st.dataframe(res.diff_counts, use_container_width=True, height=260)
-
                 st.markdown("#### Tabla de diferencias (binaria + valores old/new)")
                 st.dataframe(res.differences, use_container_width=True, height=420)
 
-                # Downloads
                 files = {
                     f"different_{ftype}s.csv": _df_to_csv_bytes(res.additional_records),
                     f"different_data_{ftype}.csv": _df_to_csv_bytes(res.differences),
                     f"diff_counts_{ftype}.csv": _df_to_csv_bytes(res.diff_counts),
                 }
-                zip_blob = _zip_bytes(files)
                 st.download_button(
                     "Descargar resultados (.zip)",
-                    data=zip_blob,
+                    data=_zip_bytes(files),
                     file_name=f"dbcheck_compare_{ftype}.zip",
                     mime="application/zip",
                 )
-
     else:
         st.info("Sube ambos CSV (OLD y NEW) para habilitar la comparación.")
 
-# --------------------------
-# 2) COLLAR VALIDATION
-# --------------------------
 with tab_collar:
     st.subheader("Validar Collar")
     f = st.file_uploader("CSV Collar", type=["csv"], key="collar_file")
     if f:
         df = _read_csv(f, encoding)
+        _quality_profile(df, "Collar")
+
         st.write("Vista rápida")
         st.dataframe(df.head(20), use_container_width=True)
 
@@ -193,18 +295,19 @@ with tab_collar:
             except Exception as e:
                 st.error(f"Error: {e}")
             else:
-                c1, c2 = st.columns([1, 2])
-                with c1:
-                    st.metric("Errores detectados", int(len(res.errors)))
-                with c2:
-                    st.dataframe(res.summary, use_container_width=True, height=240)
+                st.markdown("#### Dashboard de errores")
+                filtered = _render_error_dashboard(res.errors, bhid_col=bhid)
 
-                st.markdown("#### Registros con error")
-                st.dataframe(res.errors, use_container_width=True, height=420)
+                st.markdown("#### Resumen por tipo")
+                st.dataframe(res.summary, use_container_width=True, height=220)
 
+                st.markdown("#### Registros con error (filtrados)")
+                st.dataframe(filtered, use_container_width=True, height=420)
+
+                export_summary = filtered.groupby(["TYPE", "SEVERITY"], as_index=False).size().rename(columns={"size": "n"}) if not filtered.empty else res.summary
                 files = {
-                    "error_collar.csv": _df_to_csv_bytes(res.errors),
-                    "error_collar_summary.csv": _df_to_csv_bytes(res.summary),
+                    "error_collar.csv": _df_to_csv_bytes(filtered),
+                    "error_collar_summary.csv": _df_to_csv_bytes(export_summary),
                 }
                 st.download_button(
                     "Descargar resultados (.zip)",
@@ -215,14 +318,13 @@ with tab_collar:
     else:
         st.info("Sube un CSV de collar para habilitar la validación.")
 
-# --------------------------
-# 3) SURVEY VALIDATION
-# --------------------------
 with tab_survey:
     st.subheader("Validar Survey")
     f = st.file_uploader("CSV Survey", type=["csv"], key="survey_file")
     if f:
         df = _read_csv(f, encoding)
+        _quality_profile(df, "Survey")
+
         st.write("Vista rápida")
         st.dataframe(df.head(20), use_container_width=True)
 
@@ -230,7 +332,6 @@ with tab_survey:
         st.markdown("#### Mapeo de columnas")
         bhid = _mapping_ui("Hole ID", cols, _auto_select(cols, ["HOLEID", "BHID", "HOLE_ID", "HOLE"]))
         at = _mapping_ui("Depth/AT", cols, _auto_select(cols, ["AT", "DEPTH", "MD", "MEASDEPTH"]))
-        # IMPORTANT: enforce explicit azimuth/dip mapping (common confusion in scripts)
         az = _mapping_ui("Azimuth (0–360)", cols, _auto_select(cols, ["AZIMUTH", "AZI", "BRG", "BEARING"]))
         dip = _mapping_ui("Dip/Inclination (-90–90)", cols, _auto_select(cols, ["DIP", "INCLINATION", "INC"]))
 
@@ -251,21 +352,22 @@ with tab_survey:
             except Exception as e:
                 st.error(f"Error: {e}")
             else:
-                c1, c2 = st.columns([1, 2])
-                with c1:
-                    st.metric("Errores detectados", int(len(res.errors)))
-                with c2:
-                    st.dataframe(res.summary, use_container_width=True, height=240)
+                st.markdown("#### Dashboard de errores")
+                filtered = _render_error_dashboard(res.errors, bhid_col=bhid, depth_col=at)
 
-                st.markdown("#### Registros con error")
-                st.dataframe(res.errors, use_container_width=True, height=420)
+                st.markdown("#### Resumen por tipo")
+                st.dataframe(res.summary, use_container_width=True, height=220)
+
+                st.markdown("#### Registros con error (filtrados)")
+                st.dataframe(filtered, use_container_width=True, height=420)
 
                 st.markdown("#### Survey con DLS calculado (debug / QA)")
                 st.dataframe(res.extra["survey_dls"].head(200), use_container_width=True, height=320)
 
+                export_summary = filtered.groupby(["TYPE", "SEVERITY"], as_index=False).size().rename(columns={"size": "n"}) if not filtered.empty else res.summary
                 files = {
-                    "error_survey.csv": _df_to_csv_bytes(res.errors),
-                    "error_survey_summary.csv": _df_to_csv_bytes(res.summary),
+                    "error_survey.csv": _df_to_csv_bytes(filtered),
+                    "error_survey_summary.csv": _df_to_csv_bytes(export_summary),
                     "survey_dls.csv": _df_to_csv_bytes(res.extra["survey_dls"]),
                 }
                 st.download_button(
@@ -277,14 +379,13 @@ with tab_survey:
     else:
         st.info("Sube un CSV de survey para habilitar la validación.")
 
-# --------------------------
-# 4) ASSAY VALIDATION
-# --------------------------
 with tab_assay:
     st.subheader("Validar Assay")
     f = st.file_uploader("CSV Assay", type=["csv"], key="assay_file")
     if f:
         df = _read_csv(f, encoding)
+        _quality_profile(df, "Assay")
+
         st.write("Vista rápida")
         st.dataframe(df.head(20), use_container_width=True)
 
@@ -302,12 +403,7 @@ with tab_assay:
         sampleid = None if sampleid == "(no)" else sampleid
 
         st.markdown("#### Máximos esperados (para 'unexpected grades')")
-        if grade_fields:
-            maxes = []
-            for gf in grade_fields:
-                maxes.append(st.number_input(f"Max {gf}", min_value=0.0, value=2.0, step=0.5))
-        else:
-            maxes = []
+        maxes = [st.number_input(f"Max {gf}", min_value=0.0, value=2.0, step=0.5) for gf in grade_fields] if grade_fields else []
 
         if st.button("Ejecutar validación de assay", type="primary", disabled=(len(grade_fields) == 0)):
             try:
@@ -323,18 +419,19 @@ with tab_assay:
             except Exception as e:
                 st.error(f"Error: {e}")
             else:
-                c1, c2 = st.columns([1, 2])
-                with c1:
-                    st.metric("Errores detectados", int(len(res.errors)))
-                with c2:
-                    st.dataframe(res.summary, use_container_width=True, height=240)
+                st.markdown("#### Dashboard de errores")
+                filtered = _render_error_dashboard(res.errors, bhid_col=bhid, depth_col=from_i)
 
-                st.markdown("#### Registros con error")
-                st.dataframe(res.errors, use_container_width=True, height=420)
+                st.markdown("#### Resumen por tipo")
+                st.dataframe(res.summary, use_container_width=True, height=220)
 
+                st.markdown("#### Registros con error (filtrados)")
+                st.dataframe(filtered, use_container_width=True, height=420)
+
+                export_summary = filtered.groupby(["TYPE", "SEVERITY"], as_index=False).size().rename(columns={"size": "n"}) if not filtered.empty else res.summary
                 files = {
-                    "error_assay.csv": _df_to_csv_bytes(res.errors),
-                    "error_assay_summary.csv": _df_to_csv_bytes(res.summary),
+                    "error_assay.csv": _df_to_csv_bytes(filtered),
+                    "error_assay_summary.csv": _df_to_csv_bytes(export_summary),
                 }
                 st.download_button(
                     "Descargar resultados (.zip)",
