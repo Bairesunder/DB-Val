@@ -1,4 +1,5 @@
 import io
+import os
 import zipfile
 from typing import Dict, List, Optional
 
@@ -114,6 +115,39 @@ def _quality_profile(df: pd.DataFrame, title: str) -> None:
             st.dataframe(stats[view_cols].head(30), use_container_width=True, height=260)
 
 
+def _detect_convertible_columns(df: pd.DataFrame) -> List[str]:
+    candidates = [
+        "FROM",
+        "TO",
+        "AT",
+        "DEPTH",
+        "MD",
+        "LENGTH",
+        "THICKNESS",
+        "ELEVATION",
+        "RL",
+        "X",
+        "Y",
+        "Z",
+        "EAST",
+        "NORTH",
+    ]
+    numeric_cols = set(df.select_dtypes(include="number").columns.tolist())
+    detected = []
+    for col in df.columns:
+        name = str(col).upper()
+        if col in numeric_cols and any(key in name for key in candidates):
+            detected.append(col)
+    return detected
+
+
+def _convert_columns(df: pd.DataFrame, columns: List[str], factor: float) -> pd.DataFrame:
+    out = df.copy()
+    for col in columns:
+        out[col] = pd.to_numeric(out[col], errors="coerce") * factor
+    return out
+
+
 def _render_error_dashboard(errors: pd.DataFrame, bhid_col: str, depth_col: Optional[str] = None) -> pd.DataFrame:
     if errors.empty:
         st.success("No se detectaron errores con las reglas actuales.")
@@ -183,7 +217,13 @@ with st.sidebar:
     script_compatible = st.toggle("Modo compatible con el script (fillna=0 en comparación)", value=True)
     st.markdown('<div class="small-note">Actívalo si quieres reproducir exactamente el comportamiento histórico del script.</div>', unsafe_allow_html=True)
 
-tab_compare, tab_collar, tab_survey, tab_assay = st.tabs(["Comparar OLD vs NEW", "Validar Collar", "Validar Survey", "Validar Assay"])
+tab_compare, tab_collar, tab_survey, tab_assay, tab_convert = st.tabs([
+    "Comparar OLD vs NEW",
+    "Validar Collar",
+    "Validar Survey",
+    "Validar Assay",
+    "Transformar unidades",
+])
 
 with tab_compare:
     st.subheader("Comparar OLD vs NEW")
@@ -441,3 +481,85 @@ with tab_assay:
                 )
     else:
         st.info("Sube un CSV de assays para habilitar la validación.")
+
+with tab_convert:
+    st.subheader("Transformación de unidades (pies ↔ metros)")
+    st.caption("Carga Collar, Survey, Assays y cualquier otro archivo para convertir columnas numéricas de distancia.")
+
+    direction = st.radio(
+        "Dirección de conversión",
+        options=["Pies → Metros", "Metros → Pies"],
+        horizontal=True,
+    )
+    factor = 0.3048 if direction == "Pies → Metros" else 3.280839895
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        f_collar = st.file_uploader("Collar (CSV)", type=["csv"], key="conv_collar")
+    with c2:
+        f_survey = st.file_uploader("Survey (CSV)", type=["csv"], key="conv_survey")
+    with c3:
+        f_assays = st.file_uploader("Assays (CSV)", type=["csv"], key="conv_assays")
+
+    f_extra = st.file_uploader(
+        "Otros archivos (lithology, geology, etc.)",
+        type=["csv"],
+        accept_multiple_files=True,
+        key="conv_extra",
+    )
+
+    uploaded_files = []
+    for label, f in [("Collar", f_collar), ("Survey", f_survey), ("Assays", f_assays)]:
+        if f is not None:
+            uploaded_files.append((label, f))
+    for f in f_extra or []:
+        uploaded_files.append((f"Extra: {f.name}", f))
+
+    if uploaded_files:
+        st.markdown("#### Selección de columnas a convertir")
+        dfs: Dict[str, pd.DataFrame] = {}
+        selected_by_file: Dict[str, List[str]] = {}
+
+        for i, (label, uploaded) in enumerate(uploaded_files):
+            df = _read_csv(uploaded, encoding)
+            file_key = f"{i}_{uploaded.name}"
+            dfs[file_key] = df
+
+            detected = _detect_convertible_columns(df)
+            numeric_cols = df.select_dtypes(include="number").columns.tolist()
+
+            with st.expander(f"{label} — {uploaded.name}", expanded=(i < 3)):
+                st.write(f"Filas: {len(df)} · Columnas: {len(df.columns)}")
+                selected = st.multiselect(
+                    "Columnas a convertir",
+                    options=numeric_cols,
+                    default=detected,
+                    key=f"conv_cols_{file_key}",
+                )
+                selected_by_file[file_key] = selected
+                st.dataframe(df.head(10), use_container_width=True, height=220)
+
+        if st.button("Transformar archivos", type="primary"):
+            output_files: Dict[str, bytes] = {}
+            summary_rows = []
+
+            for (label, uploaded), (file_key, df) in zip(uploaded_files, dfs.items()):
+                selected_cols = selected_by_file.get(file_key, [])
+                converted = _convert_columns(df, selected_cols, factor) if selected_cols else df.copy()
+                base, _ = os.path.splitext(uploaded.name)
+                suffix = "m" if direction == "Pies → Metros" else "ft"
+                out_name = f"{base}_{suffix}.csv"
+                output_files[out_name] = _df_to_csv_bytes(converted)
+                summary_rows.append({"archivo": uploaded.name, "columnas_convertidas": len(selected_cols), "output": out_name})
+
+            summary_df = pd.DataFrame(summary_rows)
+            st.success("Conversión completada. Puedes descargar cada CSV convertido en un solo ZIP.")
+            st.dataframe(summary_df, use_container_width=True)
+            st.download_button(
+                "Descargar resultados convertidos (.zip)",
+                data=_zip_bytes(output_files),
+                file_name="db_units_converted.zip",
+                mime="application/zip",
+            )
+    else:
+        st.info("Sube al menos un archivo CSV para convertir unidades.")
