@@ -234,6 +234,14 @@ def _transform_coordinates(
 
     return out
 
+
+def _validate_coordinate_params(scale_xy: float, scale_z: float, inverse: bool) -> Optional[str]:
+    if inverse and scale_xy == 0:
+        return "Escala XY no puede ser 0 en modo inverso (Global → Local)."
+    if inverse and scale_z == 0:
+        return "Escala Z no puede ser 0 en modo inverso (Global → Local)."
+    return None
+
 def _prepare_uploaded_files(
     f_collar,
     f_survey,
@@ -637,6 +645,11 @@ with tab_convert:
             st.caption("Z' = Tz + Sz*Z")
 
         inverse_transform = coord_mode == "Global → Local (inversa)"
+        coord_param_error = _validate_coordinate_params(float(scale_xy), float(scale_z), bool(inverse_transform))
+        if coord_param_error:
+            st.error(coord_param_error)
+    else:
+        coord_param_error = None
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -709,7 +722,7 @@ with tab_convert:
 
                 st.dataframe(df.head(10), use_container_width=True, height=220)
 
-        if st.button("Transformar archivos", type="primary"):
+        if st.button("Transformar archivos", type="primary", disabled=bool(coord_transform and coord_param_error)):
             output_files: Dict[str, bytes] = {}
             summary_rows = []
             report_rows = []
@@ -757,7 +770,13 @@ with tab_convert:
                 })
 
                 for _, row in summary.iterrows():
-                    report_rows.append({"archivo": uploaded.name, **row.to_dict()})
+                    report_rows.append({
+                        "archivo": uploaded.name,
+                        "crs_source": source_crs if coord_transform else None,
+                        "crs_target": target_crs if coord_transform else None,
+                        "coord_mode": coord_mode if coord_transform else None,
+                        **row.to_dict(),
+                    })
 
                 st.markdown(f"##### Resultado: {uploaded.name}")
                 if warnings_list:
