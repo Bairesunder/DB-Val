@@ -1,6 +1,8 @@
 import io
+import math
+import os
 import zipfile
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -114,6 +116,138 @@ def _quality_profile(df: pd.DataFrame, title: str) -> None:
             st.dataframe(stats[view_cols].head(30), use_container_width=True, height=260)
 
 
+def _detect_convertible_columns(df: pd.DataFrame) -> List[str]:
+    candidates = [
+        "FROM",
+        "TO",
+        "AT",
+        "DEPTH",
+        "MD",
+        "LENGTH",
+        "THICKNESS",
+        "ELEVATION",
+        "RL",
+        "X",
+        "Y",
+        "Z",
+        "EAST",
+        "NORTH",
+    ]
+    numeric_cols = set(df.select_dtypes(include="number").columns.tolist())
+    detected = []
+    for col in df.columns:
+        name = str(col).upper()
+        if col in numeric_cols and any(key in name for key in candidates):
+            detected.append(col)
+    return detected
+
+
+def _convert_columns(df: pd.DataFrame, columns: List[str], factor: float) -> pd.DataFrame:
+    out = df.copy()
+    for col in columns:
+        out[col] = pd.to_numeric(out[col], errors="coerce") * factor
+    return out
+
+
+
+
+def _summarize_conversion(df_before: pd.DataFrame, df_after: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    rows = []
+    for col in columns:
+        before = pd.to_numeric(df_before[col], errors="coerce")
+        after = pd.to_numeric(df_after[col], errors="coerce")
+        rows.append({
+            "columna": col,
+            "no_nulos": int(after.notna().sum()),
+            "min_before": float(before.min()) if before.notna().any() else None,
+            "max_before": float(before.max()) if before.notna().any() else None,
+            "min_after": float(after.min()) if after.notna().any() else None,
+            "max_after": float(after.max()) if after.notna().any() else None,
+        })
+    return pd.DataFrame(rows)
+
+
+def _from_to_warnings(df: pd.DataFrame) -> List[str]:
+    warnings: List[str] = []
+    upper = {str(c).upper(): c for c in df.columns}
+    from_col = upper.get("FROM")
+    to_col = upper.get("TO")
+    if from_col and to_col:
+        from_num = pd.to_numeric(df[from_col], errors="coerce")
+        to_num = pd.to_numeric(df[to_col], errors="coerce")
+        bad = int(((from_num > to_num) & from_num.notna() & to_num.notna()).sum())
+        if bad > 0:
+            warnings.append(f"Se detectaron {bad} intervalos con FROM > TO.")
+    return warnings
+
+
+
+
+def _pick_default_coordinate_cols(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    cols = df.columns.tolist()
+    return {
+        "x": _auto_select(cols, ["EAST", "EASTING", "X", "XCOLLAR", "X_LOCAL"]),
+        "y": _auto_select(cols, ["NORTH", "NORTHING", "Y", "YCOLLAR", "Y_LOCAL"]),
+        "z": _auto_select(cols, ["ELEVATION", "RL", "Z", "ZCOLLAR", "Z_LOCAL"]),
+    }
+
+
+def _transform_coordinates(
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    z_col: Optional[str],
+    tx: float,
+    ty: float,
+    tz: float,
+    scale_xy: float,
+    rotation_deg: float,
+    scale_z: float,
+    inverse: bool,
+) -> pd.DataFrame:
+    out = df.copy()
+    x = pd.to_numeric(out[x_col], errors="coerce")
+    y = pd.to_numeric(out[y_col], errors="coerce")
+
+    theta = math.radians(rotation_deg)
+    c = math.cos(theta)
+    s = math.sin(theta)
+
+    if not inverse:
+        xr = scale_xy * (x * c - y * s) + tx
+        yr = scale_xy * (x * s + y * c) + ty
+        out[x_col] = xr
+        out[y_col] = yr
+        if z_col:
+            z = pd.to_numeric(out[z_col], errors="coerce")
+            out[z_col] = (z * scale_z) + tz
+    else:
+        x0 = (x - tx) / scale_xy if scale_xy != 0 else x * float("nan")
+        y0 = (y - ty) / scale_xy if scale_xy != 0 else y * float("nan")
+        xr = x0 * c + y0 * s
+        yr = -x0 * s + y0 * c
+        out[x_col] = xr
+        out[y_col] = yr
+        if z_col:
+            z = pd.to_numeric(out[z_col], errors="coerce")
+            out[z_col] = (z - tz) / scale_z if scale_z != 0 else z * float("nan")
+
+    return out
+
+def _prepare_uploaded_files(
+    f_collar,
+    f_survey,
+    f_assays,
+    extra_files,
+) -> List[Tuple[str, object]]:
+    uploaded_files: List[Tuple[str, object]] = []
+    for label, f in [("Collar", f_collar), ("Survey", f_survey), ("Assays", f_assays)]:
+        if f is not None:
+            uploaded_files.append((label, f))
+    for f in extra_files or []:
+        uploaded_files.append((f"Extra: {f.name}", f))
+    return uploaded_files
+
 def _render_error_dashboard(errors: pd.DataFrame, bhid_col: str, depth_col: Optional[str] = None) -> pd.DataFrame:
     if errors.empty:
         st.success("No se detectaron errores con las reglas actuales.")
@@ -183,7 +317,13 @@ with st.sidebar:
     script_compatible = st.toggle("Modo compatible con el script (fillna=0 en comparación)", value=True)
     st.markdown('<div class="small-note">Actívalo si quieres reproducir exactamente el comportamiento histórico del script.</div>', unsafe_allow_html=True)
 
-tab_compare, tab_collar, tab_survey, tab_assay = st.tabs(["Comparar OLD vs NEW", "Validar Collar", "Validar Survey", "Validar Assay"])
+tab_compare, tab_collar, tab_survey, tab_assay, tab_convert = st.tabs([
+    "Comparar OLD vs NEW",
+    "Validar Collar",
+    "Validar Survey",
+    "Validar Assay",
+    "Transformar unidades",
+])
 
 with tab_compare:
     st.subheader("Comparar OLD vs NEW")
@@ -441,3 +581,215 @@ with tab_assay:
                 )
     else:
         st.info("Sube un CSV de assays para habilitar la validación.")
+
+with tab_convert:
+    st.subheader("Transformación de unidades (pies ↔ metros)")
+    st.caption("Carga Collar, Survey, Assays y cualquier otro archivo para convertir columnas numéricas de distancia.")
+
+    c0, c1, c2 = st.columns([2, 1, 1])
+    with c0:
+        direction = st.radio(
+            "Dirección de conversión",
+            options=["Pies → Metros", "Metros → Pies"],
+            horizontal=True,
+        )
+    with c1:
+        decimals = st.number_input("Decimales", min_value=0, max_value=8, value=3, step=1)
+    with c2:
+        convert_all_numeric = st.toggle("Convertir todas las numéricas", value=False)
+
+    factor = 0.3048 if direction == "Pies → Metros" else 3.280839895
+
+    st.markdown("#### Transformación de sistema de coordenadas (opcional)")
+    coord_transform = st.toggle("Aplicar transformación de coordenadas", value=False)
+
+    coord_mode = "Sin transformación"
+    source_crs = "Local"
+    target_crs = "Local"
+    tx = ty = tz = 0.0
+    scale_xy = scale_z = 1.0
+    rotation_deg = 0.0
+    inverse_transform = False
+
+    if coord_transform:
+        cm1, cm2, cm3 = st.columns(3)
+        with cm1:
+            source_crs = st.text_input("CRS origen", value="LOCAL_MINE_GRID")
+        with cm2:
+            target_crs = st.text_input("CRS destino", value="WGS84_UTM")
+        with cm3:
+            coord_mode = st.selectbox("Modo", options=["Local → Global", "Global → Local (inversa)"])
+
+        cp1, cp2, cp3, cp4 = st.columns(4)
+        with cp1:
+            tx = st.number_input("Traslación X", value=0.0, format="%.6f")
+            ty = st.number_input("Traslación Y", value=0.0, format="%.6f")
+        with cp2:
+            tz = st.number_input("Traslación Z", value=0.0, format="%.6f")
+            rotation_deg = st.number_input("Rotación XY (grados)", value=0.0, format="%.6f")
+        with cp3:
+            scale_xy = st.number_input("Escala XY", min_value=0.0, value=1.0, format="%.9f")
+            scale_z = st.number_input("Escala Z", min_value=0.0, value=1.0, format="%.9f")
+        with cp4:
+            st.markdown("**Modelo aplicado**")
+            st.caption("X' = Tx + Sxy*(X*cosθ - Y*sinθ)")
+            st.caption("Y' = Ty + Sxy*(X*sinθ + Y*cosθ)")
+            st.caption("Z' = Tz + Sz*Z")
+
+        inverse_transform = coord_mode == "Global → Local (inversa)"
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        f_collar = st.file_uploader("Collar (CSV)", type=["csv"], key="conv_collar")
+    with c2:
+        f_survey = st.file_uploader("Survey (CSV)", type=["csv"], key="conv_survey")
+    with c3:
+        f_assays = st.file_uploader("Assays (CSV)", type=["csv"], key="conv_assays")
+
+    f_extra = st.file_uploader(
+        "Otros archivos (lithology, geology, etc.)",
+        type=["csv"],
+        accept_multiple_files=True,
+        key="conv_extra",
+    )
+
+    uploaded_files = _prepare_uploaded_files(f_collar, f_survey, f_assays, f_extra)
+
+    if uploaded_files:
+        st.markdown("#### Selección de columnas a convertir")
+        dfs: Dict[str, pd.DataFrame] = {}
+        selected_by_file: Dict[str, List[str]] = {}
+
+        for i, (label, uploaded) in enumerate(uploaded_files):
+            df = _read_csv(uploaded, encoding)
+            file_key = f"{i}_{uploaded.name}"
+            dfs[file_key] = df
+
+            detected = _detect_convertible_columns(df)
+            numeric_cols = df.select_dtypes(include="number").columns.tolist()
+            default_cols = numeric_cols if convert_all_numeric else detected
+
+            with st.expander(f"{label} — {uploaded.name}", expanded=(i < 3)):
+                st.write(f"Filas: {len(df)} · Columnas: {len(df.columns)}")
+                selected = st.multiselect(
+                    "Columnas a convertir",
+                    options=numeric_cols,
+                    default=default_cols,
+                    key=f"conv_cols_{file_key}",
+                )
+                selected_by_file[file_key] = selected
+
+                if coord_transform:
+                    defaults = _pick_default_coordinate_cols(df)
+                    cx1, cx2, cx3 = st.columns(3)
+                    with cx1:
+                        x_col = st.selectbox(
+                            "Columna X",
+                            options=df.columns.tolist(),
+                            index=df.columns.tolist().index(defaults["x"]) if defaults["x"] in df.columns else 0,
+                            key=f"x_{file_key}",
+                        )
+                    with cx2:
+                        y_col = st.selectbox(
+                            "Columna Y",
+                            options=df.columns.tolist(),
+                            index=df.columns.tolist().index(defaults["y"]) if defaults["y"] in df.columns else 0,
+                            key=f"y_{file_key}",
+                        )
+                    with cx3:
+                        z_opts = ["(sin Z)"] + df.columns.tolist()
+                        z_default = defaults["z"] if defaults["z"] in df.columns else "(sin Z)"
+                        z_col = st.selectbox(
+                            "Columna Z (opcional)",
+                            options=z_opts,
+                            index=z_opts.index(z_default) if z_default in z_opts else 0,
+                            key=f"z_{file_key}",
+                        )
+                    selected_by_file[f"coord_{file_key}"] = [x_col, y_col, z_col]
+
+                st.dataframe(df.head(10), use_container_width=True, height=220)
+
+        if st.button("Transformar archivos", type="primary"):
+            output_files: Dict[str, bytes] = {}
+            summary_rows = []
+            report_rows = []
+
+            for (_, uploaded), (file_key, df) in zip(uploaded_files, dfs.items()):
+                selected_cols = selected_by_file.get(file_key, [])
+                converted = _convert_columns(df, selected_cols, factor) if selected_cols else df.copy()
+                if selected_cols:
+                    converted[selected_cols] = converted[selected_cols].round(int(decimals))
+
+                if coord_transform:
+                    x_col, y_col, z_col = selected_by_file.get(f"coord_{file_key}", [None, None, "(sin Z)"])
+                    z_col = None if z_col == "(sin Z)" else z_col
+                    if x_col and y_col:
+                        converted = _transform_coordinates(
+                            df=converted,
+                            x_col=x_col,
+                            y_col=y_col,
+                            z_col=z_col,
+                            tx=float(tx),
+                            ty=float(ty),
+                            tz=float(tz),
+                            scale_xy=float(scale_xy),
+                            rotation_deg=float(rotation_deg),
+                            scale_z=float(scale_z),
+                            inverse=bool(inverse_transform),
+                        )
+                        coord_cols = [x_col, y_col] + ([z_col] if z_col else [])
+                        converted[coord_cols] = converted[coord_cols].round(int(decimals))
+
+                base, _ = os.path.splitext(uploaded.name)
+                suffix = "m" if direction == "Pies → Metros" else "ft"
+                out_name = f"{base}_{suffix}.csv"
+                output_files[out_name] = _df_to_csv_bytes(converted)
+
+                summary = _summarize_conversion(df, converted, selected_cols) if selected_cols else pd.DataFrame()
+                warnings_list = _from_to_warnings(converted)
+                summary_rows.append({
+                    "archivo": uploaded.name,
+                    "columnas_convertidas": len(selected_cols),
+                    "advertencias": " | ".join(warnings_list) if warnings_list else "OK",
+                    "output": out_name,
+                    "crs": f"{source_crs} -> {target_crs}" if coord_transform else "Sin cambio",
+                    "modo_coord": coord_mode if coord_transform else "Sin transformación",
+                })
+
+                for _, row in summary.iterrows():
+                    report_rows.append({"archivo": uploaded.name, **row.to_dict()})
+
+                st.markdown(f"##### Resultado: {uploaded.name}")
+                if warnings_list:
+                    for w in warnings_list:
+                        st.warning(w)
+                if selected_cols:
+                    compare_cols = selected_cols[: min(3, len(selected_cols))]
+                    preview = pd.concat(
+                        [df[compare_cols].head(8).add_suffix("_before"), converted[compare_cols].head(8).add_suffix("_after")],
+                        axis=1,
+                    )
+                    st.dataframe(preview, use_container_width=True, height=220)
+                st.download_button(
+                    f"Descargar {out_name}",
+                    data=output_files[out_name],
+                    file_name=out_name,
+                    mime="text/csv",
+                    key=f"dl_{file_key}",
+                )
+
+            summary_df = pd.DataFrame(summary_rows)
+            report_df = pd.DataFrame(report_rows)
+            if not report_df.empty:
+                output_files["conversion_report.csv"] = _df_to_csv_bytes(report_df)
+
+            st.success("Conversión completada. Puedes descargar cada CSV por separado o todo en ZIP.")
+            st.dataframe(summary_df, use_container_width=True)
+            st.download_button(
+                "Descargar resultados convertidos (.zip)",
+                data=_zip_bytes(output_files),
+                file_name="db_units_converted.zip",
+                mime="application/zip",
+            )
+    else:
+        st.info("Sube al menos un archivo CSV para convertir unidades.")
